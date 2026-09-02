@@ -8,6 +8,7 @@ from alembic import context
 from app.core.config import get_settings
 from app.db.base import Base
 from app.modules.identity.models import Sesion, UsuarioGlobal  # noqa: F401
+from app.modules.tenant.models import Tenant, Invitacion, Plan, Suscripcion, EventoFacturacion
 
 config = context.config
 
@@ -21,9 +22,7 @@ config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"
 
 target_metadata = Base.metadata
 
-
 def run_migrations_offline() -> None:
-    """Run migrations without opening a database connection."""
     context.configure(
         url=settings.database_url,
         target_metadata=target_metadata,
@@ -34,9 +33,7 @@ def run_migrations_offline() -> None:
     with context.begin_transaction():
         context.run_migrations()
 
-
 def run_migrations_online() -> None:
-    """Run migrations using a live database connection."""
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
@@ -48,7 +45,6 @@ def run_migrations_online() -> None:
 
         with context.begin_transaction():
             context.run_migrations()
-
 
 if context.is_offline_mode():
     run_migrations_offline()
