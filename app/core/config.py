@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     argon2_hash_len: int | None = Field(default=None, validation_alias="ARGON2_HASH_LEN")
     argon2_salt_len: int | None = Field(default=None, validation_alias="ARGON2_SALT_LEN")
     app_env: str = Field(default="development", validation_alias="APP_ENV")
+    billing_webhook_secret: str | None = Field(
+        default=None, validation_alias="BILLING_WEBHOOK_SECRET"
+    )
+    webhook_tolerance_seconds: int = Field(
+        default=300, validation_alias="BILLING_WEBHOOK_TOLERANCE_SECONDS"
+    )
+    activation_ttl_days: int = Field(default=7, validation_alias="ACTIVATION_TTL_DAYS")
 
     def argon2_options(self) -> dict[str, int]:
         values = {
