@@ -6,12 +6,13 @@ from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.modules.identity.models import UsuarioGlobal
 from app.modules.tenant.catalog import is_approved_active_plan
 from app.modules.tenant.models import (
     CheckoutIntent,
@@ -20,6 +21,7 @@ from app.modules.tenant.models import (
     Plan,
     Suscripcion,
     Tenant,
+    TenantAdministrator,
 )
 
 
@@ -32,6 +34,7 @@ CheckoutMismatchError = type("CheckoutMismatchError", (Exception,), {})
 CheckoutAlreadyProvisionedError = type("CheckoutAlreadyProvisionedError", (Exception,), {})
 IdempotencyConflictError = type("IdempotencyConflictError", (Exception,), {})
 OnboardingNotProvisionedError = type("OnboardingNotProvisionedError", (Exception,), {})
+SubscriptionConversionConflictError = type("SubscriptionConversionConflictError", (ValueError,), {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +296,224 @@ class TenantRepository:
     # =======================================================
     # HU-005 & HU-006: Activar prueba, suscribirse y gestionar
     # =======================================================
+    def _administrator(self, usuario_global_id: UUID) -> tuple[Any, Suscripcion] | None:
+        rows = self.session.execute(
+            select(TenantAdministrator, Invitacion, Suscripcion)
+            .join(Invitacion, Invitacion.id == TenantAdministrator.invitacion_id)
+            .join(Suscripcion, Suscripcion.tenant_id == TenantAdministrator.tenant_id)
+            .join(UsuarioGlobal, UsuarioGlobal.id == TenantAdministrator.usuario_global_id)
+            .where(
+                TenantAdministrator.usuario_global_id == usuario_global_id,
+                TenantAdministrator.activo.is_(True),
+                UsuarioGlobal.estado == "activo",
+            )
+            .with_for_update()
+        ).all()
+        if len(rows) != 1:
+            return None
+        admin, invitation, subscription = rows[0]
+        if (
+            invitation.tenant_id != admin.tenant_id
+            or invitation.estado != "consumida"
+            or invitation.consumido_en is None
+            or subscription.tenant_id != admin.tenant_id
+        ):
+            return None
+        return admin, subscription
+
+    def bootstrap_administrador(self, usuario_global_id: UUID, correo: str) -> Any:
+        correo = correo.strip().lower()
+        current = self._administrator(usuario_global_id)
+        if current:
+            admin, _ = current
+            return SimpleNamespace(id=admin.id, tenant_id=admin.tenant_id, activo=True)
+        candidates = self.session.execute(
+            select(Invitacion, Tenant, Suscripcion)
+            .join(Tenant, Tenant.id == Invitacion.tenant_id)
+            .join(Suscripcion, Suscripcion.tenant_id == Tenant.id)
+            .join(UsuarioGlobal, UsuarioGlobal.id == usuario_global_id)
+            .where(
+                UsuarioGlobal.estado == "activo",
+                Invitacion.correo.ilike(correo),
+                Invitacion.estado == "consumida",
+                Invitacion.consumido_en.is_not(None),
+                Suscripcion.estado == "active",
+                ~select(TenantAdministrator.id)
+                .where(TenantAdministrator.invitacion_id == Invitacion.id)
+                .exists(),
+            )
+            .with_for_update()
+        ).all()
+        if len(candidates) != 1:
+            self.session.rollback()
+            return None
+        invitation, tenant, _ = candidates[0]
+        admin = TenantAdministrator(
+            id=uuid4(),
+            tenant_id=tenant.id,
+            usuario_global_id=usuario_global_id,
+            invitacion_id=invitation.id,
+            activo=True,
+        )
+        try:
+            self.session.add(admin)
+            self.session.flush()
+            self.session.commit()
+            return SimpleNamespace(id=admin.id, tenant_id=admin.tenant_id, activo=True)
+        except IntegrityError:
+            self.session.rollback()
+            current = self._administrator(usuario_global_id)
+            if current:
+                admin, _ = current
+                return SimpleNamespace(id=admin.id, tenant_id=admin.tenant_id, activo=True)
+            raise
+        except Exception:
+            self.session.rollback()
+            raise
+
+    def buscar_suscripcion_autorizada(self, usuario_global_id: UUID) -> Suscripcion | None:
+        current = self._administrator(usuario_global_id)
+        return None if current is None else current[1]
+
+    def activar_prueba_autorizada(
+        self, usuario_global_id: UUID, inicio: datetime, fin: datetime
+    ) -> Suscripcion | None:
+        current = self._administrator(usuario_global_id)
+        if current is None:
+            self.session.rollback()
+            return None
+        subscription = current[1]
+        if subscription.estado != "active" or any(
+            getattr(subscription, field, None) is not None
+            for field in ("trial_inicio", "trial_fin", "periodo_inicio", "periodo_fin")
+        ):
+            self.session.rollback()
+            return None
+        try:
+            subscription.estado = "trialing"
+            subscription.trial_inicio = inicio
+            subscription.trial_fin = fin
+            self.session.flush()
+            self.session.commit()
+            return subscription
+        except Exception:
+            self.session.rollback()
+            raise
+
+    @staticmethod
+    def _monthly_result(event: EventoFacturacion) -> Any:
+        return SimpleNamespace(
+            evento_id=event.id,
+            subscription_id=event.suscripcion_id,
+            estado="active",
+            periodo_inicio=event.resultado_periodo_inicio,
+            periodo_fin=event.resultado_periodo_fin,
+        )
+
+    def _monthly_replay(
+        self, event: EventoFacturacion, payload_hash: str, subscription_id: UUID
+    ) -> Any:
+        if (
+            event.tipo != "subscription.monthly.succeeded"
+            or event.payload_hash is None
+            or not hmac.compare_digest(event.payload_hash, payload_hash)
+            or event.suscripcion_id != subscription_id
+            or event.resultado_periodo_inicio is None
+            or event.resultado_periodo_fin is None
+        ):
+            self.session.rollback()
+            raise IdempotencyConflictError
+        result = self._monthly_result(event)
+        self.session.rollback()
+        return result
+
+    def convertir_suscripcion_mensual(
+        self,
+        subscription_id: UUID,
+        plan_id: UUID,
+        monto_bob: Any,
+        idempotency_key: str,
+        payload_firmado: str | bytes,
+        payload_hash: str,
+        periodo_inicio: datetime,
+        periodo_fin: datetime,
+        evento_id: UUID | None = None,
+    ) -> Any:
+        try:
+            existing = self._find(
+                EventoFacturacion,
+                EventoFacturacion.idempotency_key == idempotency_key,
+                lock=True,
+            )
+            if existing is not None:
+                return self._monthly_replay(existing, payload_hash, subscription_id)
+            subscription = self._find(
+                Suscripcion, Suscripcion.id == subscription_id, lock=True
+            )
+            existing = self._find(
+                EventoFacturacion,
+                EventoFacturacion.idempotency_key == idempotency_key,
+                lock=True,
+            )
+            if existing is not None:
+                return self._monthly_replay(existing, payload_hash, subscription_id)
+            plan = (
+                self._find(Plan, Plan.id == getattr(subscription, "plan_id", None), lock=True)
+                if subscription
+                else None
+            )
+            if (
+                subscription is None
+                or plan is None
+                or not is_approved_active_plan(plan)
+                or subscription.plan_id != plan_id
+                or _money(plan.precio_bob) != _money(monto_bob)
+                or subscription.estado != "trialing"
+                or subscription.trial_inicio is None
+                or subscription.trial_fin is None
+                or subscription.periodo_inicio is not None
+                or subscription.periodo_fin is not None
+                or periodo_inicio.tzinfo is None
+                or periodo_fin.tzinfo is None
+                or periodo_inicio >= subscription.trial_fin
+            ):
+                raise SubscriptionConversionConflictError
+            subscription.estado = "active"
+            subscription.periodo_inicio = periodo_inicio
+            subscription.periodo_fin = periodo_fin
+            self.session.flush()
+            event = EventoFacturacion(
+                id=evento_id or uuid4(),
+                suscripcion_id=subscription.id,
+                tipo="subscription.monthly.succeeded",
+                payload_firmado=(
+                    payload_firmado.decode()
+                    if isinstance(payload_firmado, bytes)
+                    else payload_firmado
+                ),
+                idempotency_key=idempotency_key,
+                estado="procesado",
+                payload_hash=payload_hash,
+                resultado_periodo_inicio=periodo_inicio,
+                resultado_periodo_fin=periodo_fin,
+            )
+            self.session.add(event)
+            self.session.flush()
+            self.session.commit()
+            return self._monthly_result(event)
+        except IntegrityError:
+            self.session.rollback()
+            existing = self._find(
+                EventoFacturacion,
+                EventoFacturacion.idempotency_key == idempotency_key,
+            )
+            if existing is None:
+                raise
+            return self._monthly_replay(existing, payload_hash, subscription_id)
+        except Exception:
+            self.session.rollback()
+            raise
+
     def buscar_suscripcion(self, tenant_id: UUID) -> Suscripcion | None:
         statement = select(Suscripcion).where(Suscripcion.tenant_id == tenant_id)
         return self.session.scalar(statement)

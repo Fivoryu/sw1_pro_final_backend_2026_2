@@ -9,6 +9,7 @@ from app.core.tokens import PyJWTTokenService
 from app.modules.identity.router import router as identity_router
 from app.modules.tenant.router import router as tenant_router
 
+
 def _sanitize_validation_errors(exc: RequestValidationError) -> list[dict[str, object]]:
     sanitized = []
     for error in exc.errors():
