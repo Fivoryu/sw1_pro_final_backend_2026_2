@@ -11,7 +11,6 @@ import sqlalchemy as sa
 
 from alembic import op
 
-
 # revision identifiers, used by Alembic.
 revision: str = '0003'
 down_revision: Union[str, Sequence[str], None] = '0002'
@@ -41,7 +40,12 @@ def upgrade() -> None:
         server_default=sa.text("'activo'"),
         nullable=False,
     ),
-    sa.Column('creado_en', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column(
+        'creado_en',
+        sa.DateTime(timezone=True),
+        server_default=sa.text('now()'),
+        nullable=False,
+    ),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_table('invitacion',
