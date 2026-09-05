@@ -1,22 +1,25 @@
 from __future__ import annotations
 
+import calendar
 import hashlib
 import hmac
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
 from app.core.clock import ClockProtocol
 from app.core.config import Settings
+from app.modules.identity.schemas import MeResponse
 from app.modules.tenant.catalog import (
     APPROVED_PLAN_CODES,
     APPROVED_PLAN_DEFINITIONS,
     is_approved_active_plan,
 )
-from app.modules.tenant.models import CheckoutIntent, EventoFacturacion, Plan
+from app.modules.tenant.models import CheckoutIntent, Plan
 from app.modules.tenant.ports import (
     ActivationNotifier,
     CheckoutAccessPolicy,
@@ -33,22 +36,27 @@ from app.modules.tenant.repository import (
     OnboardingNotProvisionedError,
 )
 from app.modules.tenant.schemas import (
-    ActivarPruebaRequest,
     ActivationRequest,
     ActivationResponse,
     AltaTenantRequest,
     AltaTenantResponse,
+    BootstrapResponse,
     CambiarPlanRequest,
     CancelarSuscripcionRequest,
     CheckoutRequest,
     CheckoutResponse,
     PlanCatalogItem,
     SuscribirRequest,
+    SuscripcionConversionResponse,
+    SuscripcionProjection,
     SuscripcionResponse,
     WebhookRequest,
     WebhookResponse,
 )
-from app.modules.tenant.signatures import HMACWebhookSignatureVerifier, SignatureValidationError
+from app.modules.tenant.signatures import (
+    HMACWebhookSignatureVerifier,
+    SignatureValidationError,
+)
 
 
 class EventoDuplicadoError(Exception):
@@ -69,6 +77,9 @@ class WebhookPayloadValidationError(ValueError):
 
 
 ActivationUnavailableError = type("ActivationUnavailableError", (LookupError,), {})
+BootstrapUnavailableError = type("BootstrapUnavailableError", (LookupError,), {})
+TenantAccessUnavailableError = type("TenantAccessUnavailableError", (LookupError,), {})
+SubscriptionStateConflictError = type("SubscriptionStateConflictError", (ValueError,), {})
 
 
 class _Noop:
@@ -168,7 +179,9 @@ class TenantService:
             for item in error.errors()
         ]
 
-    def procesar_webhook(self, raw_body: bytes, timestamp: str, signature: str) -> WebhookResponse:
+    def procesar_webhook(
+        self, raw_body: bytes, timestamp: str, signature: str
+    ) -> WebhookResponse | SuscripcionConversionResponse:
         now = self.clock.now()
         self.signature_verifier.verify(
             raw_body, timestamp, signature, self._signature_validation_time(timestamp, now)
@@ -176,8 +189,30 @@ class TenantService:
         payload_hash = hashlib.sha256(raw_body).hexdigest()
         try:
             payload = WebhookRequest.model_validate_json(raw_body)
-        except ValidationError as error:
-            raise WebhookPayloadValidationError(self._validation_errors(error)) from error
+        except ValidationError:
+            try:
+                payload = SuscribirRequest.model_validate_json(raw_body)
+            except ValidationError as error:
+                raise WebhookPayloadValidationError(self._validation_errors(error)) from error
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise SignatureValidationError
+            existing = self.repository.buscar_evento_por_clave(payload.idempotency_key)
+            if existing is None:
+                try:
+                    timestamp_epoch, now_epoch = int(timestamp), int(now.timestamp())
+                except (TypeError, ValueError, OverflowError, OSError):
+                    raise SignatureValidationError from None
+                if abs(now_epoch - timestamp_epoch) > self.settings.webhook_tolerance_seconds:
+                    raise SignatureValidationError
+            inicio = now.astimezone(UTC)
+            result = self.repository.convertir_suscripcion_mensual(
+                payload.subscription_id, payload.plan_id, payload.monto_bob,
+                payload.idempotency_key, raw_body, payload_hash, inicio,
+                self.calcular_periodo_mensual(inicio).astimezone(UTC),
+            )
+            return SuscripcionConversionResponse.model_validate(
+                {**vars(result), "idempotente": existing is not None}
+            )
 
         existing = self.repository.buscar_evento_por_clave(payload.idempotency_key)
         if existing is not None:
@@ -194,7 +229,6 @@ class TenantService:
             raise SignatureValidationError from None
         if abs(now_epoch - timestamp_epoch) > self.settings.webhook_tolerance_seconds:
             raise SignatureValidationError
-
         checkout = self.repository.buscar_checkout(payload.checkout_id)
         if checkout is None:
             raise CheckoutNotAvailableError
@@ -294,46 +328,62 @@ class TenantService:
     # =======================================================
     # HU-005: Activar prueba y suscribirse
     # =======================================================
-    def activar_prueba(self, request: ActivarPruebaRequest) -> SuscripcionResponse:
-        suscripcion = self.repository.buscar_suscripcion(request.tenant_id)
-        if not suscripcion:
-            raise ValueError("Suscripción no encontrada.")
-
-        if suscripcion.trial_fin is not None:
-            raise ValueError("La prueba ya fue activada previamente.")
-
-        ahora = self.clock.now()
-        suscripcion.estado = "trialing"
-        suscripcion.trial_fin = ahora + timedelta(days=14)
-
-        suscripcion_guardada = self.repository.guardar_suscripcion(suscripcion)
-        return SuscripcionResponse.model_validate(suscripcion_guardada)
-
-    def suscribirse(self, request: SuscribirRequest) -> SuscripcionResponse:
-        if self.repository.evento_procesado(request.idempotency_key):
-            raise EventoDuplicadoError("El pago mensual ya fue procesado.")
-
-        suscripcion = self.repository.buscar_suscripcion(request.tenant_id)
-        if not suscripcion:
-            raise ValueError("Suscripción no encontrada.")
-
-        ahora = self.clock.now()
-        suscripcion.estado = "active"
-        suscripcion.plan_id = request.plan_id
-        suscripcion.periodo_fin = ahora + timedelta(days=30)
-
-        nuevo_evento = EventoFacturacion(
-            id=uuid4(),
-            suscripcion_id=suscripcion.id,
-            tipo="suscripcion_mensual",
-            payload_firmado=request.payload_firmado,
-            idempotency_key=request.idempotency_key,
-            estado="procesado",
+    def bootstrap_administrador(self, principal: MeResponse) -> BootstrapResponse:
+        correo = str(principal.correo).strip().lower()
+        existing = self.repository.buscar_suscripcion_autorizada(principal.id)
+        result = self.repository.bootstrap_administrador(principal.id, correo)
+        if result is None:
+            raise BootstrapUnavailableError
+        return BootstrapResponse.model_validate(
+            {**vars(result), "administrador_id": result.id, "idempotente": existing is not None}
         )
 
-        self.repository.registrar_evento_facturacion(nuevo_evento)
-        suscripcion_guardada = self.repository.guardar_suscripcion(suscripcion)
-        return SuscripcionResponse.model_validate(suscripcion_guardada)
+    @staticmethod
+    def trial_duration() -> timedelta:
+        return timedelta(hours=336)
+
+    @staticmethod
+    def trial_expired(now: datetime, trial_fin: datetime) -> bool:
+        return now >= trial_fin
+
+    @staticmethod
+    def calcular_periodo_mensual(periodo_inicio: datetime) -> datetime:
+        if periodo_inicio.tzinfo is None or periodo_inicio.utcoffset() is None:
+            raise ValueError("El instante debe incluir zona horaria.")
+        local = periodo_inicio.astimezone(ZoneInfo("America/La_Paz"))
+        year, month = (local.year + 1, 1) if local.month == 12 else (local.year, local.month + 1)
+        day = min(local.day, calendar.monthrange(year, month)[1])
+        return local.replace(year=year, month=month, day=day)
+
+    def activar_prueba(self, principal: MeResponse) -> SuscripcionProjection:
+        suscripcion = self.repository.buscar_suscripcion_autorizada(principal.id)
+        if suscripcion is None:
+            raise TenantAccessUnavailableError
+        if suscripcion.estado != "active" or any(
+            getattr(suscripcion, field, None) is not None
+            for field in ("trial_inicio", "trial_fin", "periodo_inicio", "periodo_fin")
+        ):
+            raise SubscriptionStateConflictError
+        ahora = self.clock.now()
+        if ahora.tzinfo is None or ahora.utcoffset() is None:
+            raise ValueError("El reloj debe devolver una fecha con zona horaria.")
+        ahora = ahora.astimezone(UTC)
+        guardada = self.repository.activar_prueba_autorizada(
+            principal.id, ahora, ahora + self.trial_duration()
+        )
+        if guardada is None:
+            raise SubscriptionStateConflictError
+        return SuscripcionProjection.model_validate(
+            {**vars(guardada), "subscription_id": guardada.id}
+        )
+
+    def inspeccionar_suscripcion(self, principal: MeResponse) -> SuscripcionProjection:
+        suscripcion = self.repository.buscar_suscripcion_autorizada(principal.id)
+        if suscripcion is None:
+            raise TenantAccessUnavailableError
+        return SuscripcionProjection.model_validate(
+            {**vars(suscripcion), "subscription_id": suscripcion.id}
+        )
 
     # =======================================================
     # HU-006: Gestionar suscripción y purga

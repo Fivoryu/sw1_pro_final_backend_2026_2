@@ -100,14 +100,40 @@ class ActivationResponse(BaseModel):
 
 
 class ActivarPruebaRequest(BaseModel):
-    tenant_id: UUID
-
+    model_config = ConfigDict(extra="forbid")
+BootstrapRequest = ActivarPruebaRequest
 
 class SuscribirRequest(BaseModel):
-    tenant_id: UUID
+    model_config = ConfigDict(extra="forbid")
+    event_type: Literal["subscription.monthly.succeeded"]
+    idempotency_key: str = Field(..., min_length=1, max_length=100)
+    subscription_id: UUID
     plan_id: UUID
-    payload_firmado: str
-    idempotency_key: str = Field(..., max_length=100)
+    monto_bob: Decimal = Field(..., allow_inf_nan=False)
+
+class SuscripcionProjection(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    subscription_id: UUID
+    plan_id: UUID
+    estado: str
+    trial_inicio: datetime | None
+    trial_fin: datetime | None
+    periodo_inicio: datetime | None
+    periodo_fin: datetime | None
+
+class BootstrapResponse(BaseModel):
+    tenant_id: UUID
+    administrador_id: UUID
+    activo: bool
+    idempotente: bool
+
+class SuscripcionConversionResponse(BaseModel):
+    evento_id: UUID
+    subscription_id: UUID
+    estado: Literal["active"]
+    periodo_inicio: datetime
+    periodo_fin: datetime
+    idempotente: bool
 
 
 class SuscripcionResponse(BaseModel):

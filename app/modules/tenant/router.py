@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 from app.core.clock import ClockProtocol, SystemClock
 from app.core.config import Settings, get_settings
 from app.db.session import get_db
+from app.modules.identity.router import get_current_user
+from app.modules.identity.schemas import MeResponse
 from app.modules.tenant.ports import CheckoutAccessDeniedError
 from app.modules.tenant.repository import (
     CheckoutAlreadyProvisionedError,
@@ -14,27 +16,33 @@ from app.modules.tenant.repository import (
     CheckoutNotAvailableError,
     IdempotencyConflictError,
     OnboardingNotProvisionedError,
+    SubscriptionConversionConflictError,
     TenantRepository,
 )
 from app.modules.tenant.schemas import (
     ActivarPruebaRequest,
     ActivationRequest,
     ActivationResponse,
+    BootstrapRequest,
+    BootstrapResponse,
     CambiarPlanRequest,
     CancelarSuscripcionRequest,
     CheckoutRequest,
     CheckoutResponse,
     PlanCatalogItem,
-    SuscribirRequest,
+    SuscripcionConversionResponse,
+    SuscripcionProjection,
     SuscripcionResponse,
     WebhookRequest,
     WebhookResponse,
 )
 from app.modules.tenant.service import (
     ActivationUnavailableError,
+    BootstrapUnavailableError,
     CatalogUnavailableError,
-    EventoDuplicadoError,
     PlanNotAvailableError,
+    SubscriptionStateConflictError,
+    TenantAccessUnavailableError,
     TenantService,
     WebhookPayloadValidationError,
 )
@@ -69,6 +77,22 @@ _ERROR_DETAILS = {
     PlanNotAvailableError: (404, "PLAN_NOT_AVAILABLE", "El plan no está disponible"),
     WebhookNotConfiguredError: (503, "WEBHOOK_NOT_CONFIGURED", "Webhook no disponible"),
     SignatureValidationError: (401, "WEBHOOK_UNAUTHORIZED", "Evento no autorizado"),
+    BootstrapUnavailableError: (404, "ADMIN_BOOTSTRAP_UNAVAILABLE", "El alta no está disponible"),
+    TenantAccessUnavailableError: (
+        404,
+        "TENANT_SUBSCRIPTION_UNAVAILABLE",
+        "La suscripción no está disponible",
+    ),
+    SubscriptionStateConflictError: (
+        409,
+        "SUBSCRIPTION_STATE_CONFLICT",
+        "La suscripción no puede activarse",
+    ),
+    SubscriptionConversionConflictError: (
+        409,
+        "SUBSCRIPTION_CONVERSION_CONFLICT",
+        "La suscripción no puede convertirse",
+    ),
     CheckoutNotAvailableError: (409, "CHECKOUT_NOT_AVAILABLE", "El checkout no está disponible"),
     CheckoutMismatchError: (
         409,
@@ -93,9 +117,10 @@ _ERROR_DETAILS = {
     ActivationUnavailableError: (410, "ACTIVATION_UNAVAILABLE", "La activación no está disponible"),
 }
 
-
 def _error_response(error: Exception) -> JSONResponse:
-    status_code, code, detail = _ERROR_DETAILS[type(error)]
+    status_code, code, detail = _ERROR_DETAILS.get(
+        type(error), (500, "TENANT_OPERATION_FAILED", "No se pudo completar la operación")
+    )
     return JSONResponse(status_code=status_code, content={"code": code, "detail": detail})
 
 
@@ -117,15 +142,21 @@ def crear_checkout(request: CheckoutRequest, service: TenantService = Depends(ge
 
 @router.post(
     "/webhook",
-    response_model=WebhookResponse,
+    response_model=WebhookResponse | SuscripcionConversionResponse,
     status_code=201,
-    responses={200: {"model": WebhookResponse}},
+    responses={200: {"model": WebhookResponse | SuscripcionConversionResponse}},
     openapi_extra={
         "requestBody": {
             "required": True,
             "content": {"application/json": {"schema": WebhookRequest.model_json_schema()}},
         }
     },
+)
+@router.post(
+    "/suscribir",
+    response_model=WebhookResponse | SuscripcionConversionResponse,
+    status_code=201,
+    deprecated=True,
 )
 async def recibir_webhook(
     request: Request, service: TenantService = Depends(get_tenant_service)
@@ -160,7 +191,10 @@ async def recibir_webhook(
         IdempotencyConflictError,
         CheckoutAlreadyProvisionedError,
         OnboardingNotProvisionedError,
+        SubscriptionConversionConflictError,
     ) as error:
+        return _error_response(error)
+    except Exception as error:
         return _error_response(error)
 
 
@@ -178,35 +212,45 @@ def consumir_activacion(
 # HU-005: Activar prueba y suscribirse
 # =======================================================
 @router.post(
-    "/activar-prueba",
-    response_model=SuscripcionResponse,
-    status_code=status.HTTP_200_OK,
+    "/administrador/bootstrap",
+    response_model=BootstrapResponse,
+    status_code=201,
+    responses={200: {"model": BootstrapResponse}},
 )
+def bootstrap_administrador(
+    _: BootstrapRequest = BootstrapRequest(),
+    principal: MeResponse = Depends(get_current_user),
+    service: TenantService = Depends(get_tenant_service),
+) -> BootstrapResponse | JSONResponse:
+    try:
+        result = service.bootstrap_administrador(principal)
+        return JSONResponse(
+            status_code=200 if result.idempotente else 201,
+            content=result.model_dump(mode="json"),
+        )
+    except Exception as error:
+        return _error_response(error)
+
+@router.post("/activar-prueba", response_model=SuscripcionProjection, status_code=200)
 def activar_prueba(
-    request: ActivarPruebaRequest,
+    _: ActivarPruebaRequest = ActivarPruebaRequest(),
+    principal: MeResponse = Depends(get_current_user),
     service: TenantService = Depends(get_tenant_service),
-) -> SuscripcionResponse:
+) -> SuscripcionProjection | JSONResponse:
     try:
-        return service.activar_prueba(request)
-    except ValueError as error:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+        return service.activar_prueba(principal)
+    except Exception as error:
+        return _error_response(error)
 
-
-@router.post(
-    "/suscribir",
-    response_model=SuscripcionResponse,
-    status_code=status.HTTP_200_OK,
-)
-def suscribir_mensual(
-    request: SuscribirRequest,
+@router.get("/suscripcion", response_model=SuscripcionProjection)
+def consultar_suscripcion(
+    principal: MeResponse = Depends(get_current_user),
     service: TenantService = Depends(get_tenant_service),
-) -> SuscripcionResponse:
+) -> SuscripcionProjection | JSONResponse:
     try:
-        return service.suscribirse(request)
-    except EventoDuplicadoError as error:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
-    except ValueError as error:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+        return service.inspeccionar_suscripcion(principal)
+    except Exception as error:
+        return _error_response(error)
 
 
 # =======================================================
