@@ -1,0 +1,63 @@
+project:
+  name: RoomForge Backend
+  slug: sw1_pro_final_backend_2026_2
+  description: >-
+    API backend modular de RoomForge para identidad, autenticación y
+    tenancy SaaS
+  repository_root: .
+  code_repository: .
+  planned_change: hu004-alta-inmobiliaria
+  planned_scope: >-
+    Backend-only para HU-004; usar como referencia los artefactos aprobados
+    del repositorio raíz sin copiarlos ni mutarlos
+
+sdd:
+  artifact_store: hybrid
+  execution: interactive
+  delivery_strategy: ask-on-risk
+  artifact_language: es
+  code_language: en
+  phases:
+    - explore
+    - proposal
+    - spec
+    - design
+    - tasks
+    - apply
+    - verify
+    - archive
+
+quality:
+  strict_tdd: true
+  test_runner: "..\\.venv\\Scripts\\python.exe -m pytest tests -q"
+  lint_runner: "..\\.venv\\Scripts\\python.exe -m ruff check app tests"
+  typecheck_runner: "..\\.venv\\Scripts\\pyright.exe app tests"
+  migration_runner: >-
+    ..\\.venv\\Scripts\\python.exe -m alembic -c alembic.ini upgrade head
+  conventions:
+    commits: conventional-commits
+    no_commits_or_pushes_during_sdd: true
+    documentation: Spanish profesional y neutral
+    code_identifiers: English
+
+repository:
+  architecture: API monolítica modular independiente
+  stack:
+    - Python >= 3.11
+    - FastAPI
+    - SQLAlchemy 2.x
+    - PostgreSQL con psycopg
+    - Alembic
+    - Argon2id
+    - PyJWT
+    - pytest
+    - Ruff
+  branch_at_init: feature/tenant-hu04-06
+  head_at_init: 7429193
+  working_tree_at_init: >-
+    clean salvo metadatos locales de CodeGraph generados durante init
+  constraints:
+    - No implementar HU-004 durante la inicialización
+    - No modificar código, ejecutar tests, crear commits ni hacer push
+    - No cambiar la rama local
+    - No copiar ni mutar artefactos del repositorio raíz
