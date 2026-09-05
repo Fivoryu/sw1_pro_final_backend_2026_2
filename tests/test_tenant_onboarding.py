@@ -4,11 +4,13 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from threading import Barrier, RLock
 from types import SimpleNamespace
 from typing import Any, Callable
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -31,6 +33,7 @@ from app.modules.tenant.repository import (
     CheckoutAlreadyProvisionedError,
     IdempotencyConflictError,
     OnboardingCommand,
+    SubscriptionConversionConflictError,
     TenantRepository,
 )
 from app.modules.tenant.router import get_tenant_service
@@ -39,7 +42,6 @@ from app.modules.tenant.schemas import (
     AltaTenantRequest,
     CambiarPlanRequest,
     CancelarSuscripcionRequest,
-    SuscribirRequest,
 )
 from app.modules.tenant.service import OnboardingNotProvisionedError, TenantService
 from app.modules.tenant.signatures import (
@@ -347,7 +349,10 @@ class OnboardingFakeRepository(FakeTenantRepository):
                     tenant_id=tenant.id,
                     plan_id=checkout.plan_id,
                     estado="active",
+                    trial_inicio=None,
                     trial_fin=None,
+                    periodo_inicio=None,
+                    periodo_fin=None,
                 )
                 if self.fail_stage == "invitation":
                     raise RuntimeError("invitation insert failed")
@@ -412,6 +417,73 @@ class OnboardingFakeRepository(FakeTenantRepository):
             invitation.estado = "consumida"
             invitation.consumido_en = now
             return SimpleNamespace(tenant_id=invitation.tenant_id, correo=invitation.correo)
+
+    @staticmethod
+    def _monthly_result(event: SimpleNamespace) -> SimpleNamespace:
+        return SimpleNamespace(
+            evento_id=event.id,
+            subscription_id=event.suscripcion_id,
+            estado="active",
+            periodo_inicio=event.resultado_periodo_inicio,
+            periodo_fin=event.resultado_periodo_fin,
+        )
+
+    def convertir_suscripcion_mensual(
+        self,
+        subscription_id: UUID,
+        plan_id: UUID,
+        monto_bob: Any,
+        idempotency_key: str,
+        payload_firmado: bytes,
+        payload_hash: str,
+        periodo_inicio: datetime,
+        periodo_fin: datetime,
+    ) -> SimpleNamespace:
+        """Fake-only monthly seam; it is not PostgreSQL evidence."""
+        del payload_firmado
+        with self.lock:
+            existing = self.events.get(idempotency_key)
+            if existing is not None:
+                if (
+                    existing.tipo != "subscription.monthly.succeeded"
+                    or existing.payload_hash != payload_hash
+                    or existing.suscripcion_id != subscription_id
+                ):
+                    raise IdempotencyConflictError
+                return self._monthly_result(existing)
+
+            subscription = self.subscriptions.get(subscription_id)
+            if subscription is None:
+                raise SubscriptionConversionConflictError
+            plan = self.buscar_plan(subscription.plan_id)
+            if (
+                plan is None
+                or subscription.plan_id != plan_id
+                or Decimal(str(plan.precio_bob)).quantize(Decimal("0.01"))
+                != Decimal(str(monto_bob)).quantize(Decimal("0.01"))
+                or subscription.estado != "trialing"
+                or subscription.trial_inicio is None
+                or subscription.trial_fin is None
+                or subscription.periodo_inicio is not None
+                or subscription.periodo_fin is not None
+                or periodo_inicio >= subscription.trial_fin
+            ):
+                raise SubscriptionConversionConflictError
+
+            subscription.estado = "active"
+            subscription.periodo_inicio = periodo_inicio
+            subscription.periodo_fin = periodo_fin
+            event = SimpleNamespace(
+                id=uuid4(),
+                suscripcion_id=subscription.id,
+                tipo="subscription.monthly.succeeded",
+                payload_hash=payload_hash,
+                idempotency_key=idempotency_key,
+                resultado_periodo_inicio=periodo_inicio,
+                resultado_periodo_fin=periodo_fin,
+            )
+            self.events[idempotency_key] = event
+            return self._monthly_result(event)
 
 
 def webhook_payload(repository: OnboardingFakeRepository, **extra: Any) -> dict[str, Any]:
@@ -1050,7 +1122,7 @@ def test_migration_source_declares_additive_schema_seed_and_downgrade_guards() -
     assert "invitation.c.consumido_en.is_not(None)" in source
 
 
-def test_openapi_contract_exposes_exact_hu004_surface_without_sensitive_outputs() -> None:
+def test_openapi_contract_exposes_tenant_surface_without_sensitive_outputs() -> None:
     with make_client(FakeTenantRepository()) as client:
         document = client.get("/openapi.json").json()
 
@@ -1062,7 +1134,9 @@ def test_openapi_contract_exposes_exact_hu004_surface_without_sensitive_outputs(
         "/api/v1/tenant/activacion/consumir",
     }
     assert tenant_paths - hu004_paths == {
+        "/api/v1/tenant/administrador/bootstrap",
         "/api/v1/tenant/activar-prueba",
+        "/api/v1/tenant/suscripcion",
         "/api/v1/tenant/suscribir",
         "/api/v1/tenant/cambiar-plan",
         "/api/v1/tenant/cancelar",
@@ -1073,8 +1147,11 @@ def test_openapi_contract_exposes_exact_hu004_surface_without_sensitive_outputs(
     operations = {
         "/api/v1/tenant/plans": ("get", "200", "PlanCatalogItem"),
         "/api/v1/tenant/checkout": ("post", "201", "CheckoutResponse"),
-        "/api/v1/tenant/webhook": ("post", "201", "WebhookResponse"),
+        "/api/v1/tenant/webhook": ("post", "201", None),
         "/api/v1/tenant/activacion/consumir": ("post", "200", "ActivationResponse"),
+        "/api/v1/tenant/administrador/bootstrap": ("post", "201", "BootstrapResponse"),
+        "/api/v1/tenant/activar-prueba": ("post", "200", "SuscripcionProjection"),
+        "/api/v1/tenant/suscripcion": ("get", "200", "SuscripcionProjection"),
     }
     forbidden_outputs = {
         "token",
@@ -1092,11 +1169,22 @@ def test_openapi_contract_exposes_exact_hu004_surface_without_sensitive_outputs(
         if path == "/api/v1/tenant/plans":
             assert schema["type"] == "array"
             assert schema["items"].get("$ref", "").endswith(schema_name)
+        elif path == "/api/v1/tenant/webhook":
+            assert {
+                item["$ref"] for item in schema["anyOf"]
+            } == {
+                "#/components/schemas/WebhookResponse",
+                "#/components/schemas/SuscripcionConversionResponse",
+            }
         else:
             assert schema.get("$ref", "").endswith(schema_name)
-        properties = document["components"]["schemas"][schema_name]["properties"]
-        assert not forbidden_outputs & properties.keys()
+        if schema_name is not None:
+            properties = document["components"]["schemas"][schema_name]["properties"]
+            assert not forbidden_outputs & properties.keys()
 
+    alias_operation = document["paths"]["/api/v1/tenant/suscribir"]["post"]
+    assert alias_operation["deprecated"] is True
+    assert "anyOf" in alias_operation["responses"]["201"]["content"]["application/json"]["schema"]
     checkout_schema = document["components"]["schemas"]["CheckoutRequest"]
     assert checkout_schema["additionalProperties"] is False
     assert not {"tenant_id", "precio_bob", "payload_firmado"} & checkout_schema["properties"].keys()
@@ -1149,7 +1237,7 @@ class LegacyBehaviorRepository(FakeTenantRepository):
         return [self.subscription]
 
 
-def test_hu005_hu006_routes_and_behavior_remain_unchanged() -> None:
+def test_hu006_routes_and_behavior_remain_unchanged() -> None:
     repository = LegacyBehaviorRepository()
     service = TenantService(
         repository,
@@ -1157,18 +1245,6 @@ def test_hu005_hu006_routes_and_behavior_remain_unchanged() -> None:
         settings=Settings(app_env="demo", billing_webhook_secret=SECRET),
     )
     tenant_id = repository.subscription.tenant_id
-
-    trial = service.activar_prueba(ActivarPruebaRequest(tenant_id=tenant_id))
-    assert trial.estado == "trialing" and trial.trial_fin == NOW + timedelta(days=14)
-    monthly = service.suscribirse(
-        SuscribirRequest(
-            tenant_id=tenant_id,
-            plan_id=repository.plans[1].id,
-            payload_firmado="legacy-payment",
-            idempotency_key="legacy-monthly",
-        )
-    )
-    assert monthly.estado == "active" and monthly.periodo_fin == NOW + timedelta(days=30)
     changed = service.cambiar_plan(
         CambiarPlanRequest(tenant_id=tenant_id, nuevo_plan_id=repository.plans[2].id)
     )
@@ -1180,7 +1256,13 @@ def test_hu005_hu006_routes_and_behavior_remain_unchanged() -> None:
     }
     assert repository.subscription.estado == "purged"
 
-    paths = create_app(Settings(app_env="demo", billing_webhook_secret=SECRET)).openapi()["paths"]
+    paths = create_app(
+        Settings(
+            jwt_secret="test-secret-for-authentication-32-bytes-long",
+            app_env="demo",
+            billing_webhook_secret=SECRET,
+        )
+    ).openapi()["paths"]
     assert {
         "/api/v1/tenant/activar-prueba",
         "/api/v1/tenant/suscribir",
@@ -1188,3 +1270,92 @@ def test_hu005_hu006_routes_and_behavior_remain_unchanged() -> None:
         "/api/v1/tenant/cancelar",
         "/api/v1/tenant/ejecutar-purga",
     } <= paths.keys()
+
+
+def test_hu005_red_contracts_require_jwt_and_server_owned_tenant() -> None:
+    schema = ActivarPruebaRequest.model_json_schema()
+    paths = create_app(
+        Settings(
+            jwt_secret="test-secret-for-authentication-32-bytes-long",
+            billing_webhook_secret=SECRET,
+        )
+    ).openapi()["paths"]
+    required = {
+        "/api/v1/tenant/administrador/bootstrap",
+        "/api/v1/tenant/activar-prueba",
+        "/api/v1/tenant/suscripcion",
+    }
+    assert schema["properties"] == {} and schema["additionalProperties"] is False
+    assert {"trial_inicio", "periodo_inicio"} <= set(Suscripcion.__table__.c.keys())
+    assert required <= paths.keys() and all(
+        "security" in paths[p]["post" if p != "/api/v1/tenant/suscripcion" else "get"]
+        for p in required
+    )
+
+
+def test_hu005_red_monthly_webhook_preserves_raw_hmac_and_idempotency() -> None:
+    repository = OnboardingFakeRepository()
+    client = ready_onboarding(repository)
+    assert (
+        post_webhook(client, webhook_payload(repository), int(NOW.timestamp())).status_code == 201
+    )
+    subscription = next(iter(repository.subscriptions.values()))
+    # Fake-only lifecycle setup; PostgreSQL transition evidence remains deferred.
+    subscription.estado = "trialing"
+    subscription.trial_inicio = NOW
+    subscription.trial_fin = NOW + timedelta(hours=336)
+    payload = {
+        "event_type": "subscription.monthly.succeeded",
+        "idempotency_key": "monthly-1",
+        "subscription_id": str(subscription.id),
+        "plan_id": str(repository.plans[0].id),
+        "monto_bob": "199.00",
+    }
+    raw, timestamp = json.dumps(payload, separators=(",", ":")).encode(), int(NOW.timestamp())
+    headers = {
+        "Content-Type": "application/json",
+        "X-RoomForge-Webhook-Timestamp": str(timestamp),
+        "X-RoomForge-Webhook-Signature": make_signature(raw, timestamp),
+    }
+    created = client.post("/api/v1/tenant/webhook", content=raw, headers=headers)
+    replay = client.post("/api/v1/tenant/suscribir", content=raw, headers=headers)
+    conflict_raw = raw + b" "
+    conflict = client.post(
+        "/api/v1/tenant/webhook",
+        content=conflict_raw,
+        headers={
+            **headers,
+            "X-RoomForge-Webhook-Signature": make_signature(conflict_raw, timestamp),
+        },
+    )
+    assert (created.status_code, replay.status_code, conflict.status_code) == (201, 200, 409)
+    assert subscription.estado == "active"
+    assert subscription.periodo_inicio == NOW
+    assert subscription.periodo_fin == TenantService.calcular_periodo_mensual(NOW).astimezone(UTC)
+    assert len(repository.events) == 2
+
+
+@pytest.mark.parametrize(
+    "start,expected",
+    [
+        ((2026, 1, 31), (2026, 2, 28)),
+        ((2028, 1, 31), (2028, 2, 29)),
+        ((2026, 3, 31), (2026, 4, 30)),
+        ((2026, 12, 31), (2027, 1, 31)),
+    ],
+)
+def test_hu005_red_monthly_calendar_clamps_in_la_paz(start, expected) -> None:
+    instant = datetime(start[0], start[1], start[2], 12, tzinfo=ZoneInfo("America/La_Paz"))
+    end = TenantService.calcular_periodo_mensual(instant)
+    assert isinstance(end.tzinfo, ZoneInfo)
+    assert (end.year, end.month, end.day, end.hour, end.tzinfo.key) == (
+        *expected,
+        12,
+        "America/La_Paz",
+    )
+
+
+def test_hu005_red_trial_and_postgres_boundaries_are_pending() -> None:
+    assert TenantService.trial_duration() == timedelta(hours=336)
+    assert hasattr(TenantRepository, "convertir_suscripcion_mensual")
+    assert list((Path(__file__).parents[1] / "alembic/versions").glob("*hu005*"))

@@ -6,10 +6,10 @@ project:
     tenancy SaaS
   repository_root: .
   code_repository: .
-  planned_change: hu004-alta-inmobiliaria
+  planned_change: hu005-trial-suscripcion
   planned_scope: >-
-    Backend-only para HU-004; usar como referencia los artefactos aprobados
-    del repositorio raíz sin copiarlos ni mutarlos
+    Backend-only para HU-005 (PB-005 / CU-005 / CP-004); los artefactos del
+    repositorio raíz son referencia externa y no se copian ni se mutan
 
 sdd:
   artifact_store: hybrid
@@ -17,6 +17,8 @@ sdd:
   delivery_strategy: ask-on-risk
   artifact_language: es
   code_language: en
+  changed_lines_budget: 400
+  strict_tdd: true
   phases:
     - explore
     - proposal
@@ -30,10 +32,10 @@ sdd:
 quality:
   strict_tdd: true
   test_runner: "..\\.venv\\Scripts\\python.exe -m pytest tests -q"
-  lint_runner: "..\\.venv\\Scripts\\python.exe -m ruff check app tests"
+  lint_runner: "..\\.venv\\Scripts\\ruff.exe check app tests"
   typecheck_runner: "..\\.venv\\Scripts\\pyright.exe app tests"
-  migration_runner: >-
-    ..\\.venv\\Scripts\\python.exe -m alembic -c alembic.ini upgrade head
+  migration_runner: "..\\.venv\\Scripts\\python.exe -m alembic -c alembic.ini upgrade head"
+  tdd_cycle: "RED → GREEN → TRIANGULATE → REFACTOR"
   conventions:
     commits: conventional-commits
     no_commits_or_pushes_during_sdd: true
@@ -52,12 +54,15 @@ repository:
     - PyJWT
     - pytest
     - Ruff
-  branch_at_init: feature/tenant-hu04-06
-  head_at_init: 7429193
-  working_tree_at_init: >-
-    clean salvo metadatos locales de CodeGraph generados durante init
+    - Pyright
+  remote_project: sw1_pro_final_backend_2026_2
+  worktree_root: D:/Universidad/Proyectos/2doSemestre2026/sw1/roomforge-hu005-backend
+  branch_at_init: feature/hu005-trial-suscripcion
+  base_branch: feature/tenant-hu04-06
   constraints:
-    - No implementar HU-004 durante la inicialización
+    - No crear artefactos de cambio durante la inicialización
     - No modificar código, ejecutar tests, crear commits ni hacer push
     - No cambiar la rama local
-    - No copiar ni mutar artefactos del repositorio raíz
+    - Runtime, tests, migraciones y contabilidad nativa pertenecen a este backend
+    - El monorepo raíz queda limitado a coordinación y documentación
+    - No asumir visibilidad automática de los artefactos HU-005 del monorepo raíz
