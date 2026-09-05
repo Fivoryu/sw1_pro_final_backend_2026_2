@@ -7,8 +7,9 @@ Create Date: 2026-09-01 23:13:29.127026
 """
 from typing import Sequence, Union
 
-from alembic import op
 import sqlalchemy as sa
+
+from alembic import op
 
 
 # revision identifiers, used by Alembic.
@@ -34,7 +35,12 @@ def upgrade() -> None:
     op.create_table('tenant',
     sa.Column('id', sa.UUID(), nullable=False),
     sa.Column('nombre', sa.String(length=120), nullable=False),
-    sa.Column('estado', sa.String(length=20), server_default=sa.text("'activo'"), nullable=False),
+    sa.Column(
+        'estado',
+        sa.String(length=20),
+        server_default=sa.text("'activo'"),
+        nullable=False,
+    ),
     sa.Column('creado_en', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
