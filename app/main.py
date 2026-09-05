@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from app.core.config import Settings, get_settings
 from app.core.tokens import PyJWTTokenService
 from app.modules.identity.router import router as identity_router
-
+from app.modules.tenant.router import router as tenant_router
 
 def _sanitize_validation_errors(exc: RequestValidationError) -> list[dict[str, object]]:
     sanitized = []
@@ -22,7 +22,6 @@ def _sanitize_validation_errors(exc: RequestValidationError) -> list[dict[str, o
         )
     return sanitized
 
-
 def _register_routes(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def request_validation_exception_handler(
@@ -32,7 +31,7 @@ def _register_routes(app: FastAPI) -> None:
         return JSONResponse(status_code=422, content={"detail": _sanitize_validation_errors(exc)})
 
     app.include_router(identity_router, prefix="/api/v1")
-
+    app.include_router(tenant_router, prefix="/api/v1")
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or get_settings()
@@ -45,7 +44,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     _register_routes(app)
     return app
 
-
 def _create_default_app() -> FastAPI:
     app = FastAPI(title="RoomForge API")
 
@@ -57,6 +55,5 @@ def _create_default_app() -> FastAPI:
 
     _register_routes(app)
     return app
-
 
 app = _create_default_app()
