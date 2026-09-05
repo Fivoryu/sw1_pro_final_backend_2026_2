@@ -2,7 +2,18 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -60,9 +71,45 @@ class Suscripcion(Base):
     tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenant.id"), nullable=False)
     plan_id: Mapped[UUID] = mapped_column(ForeignKey("plan.id"), nullable=False)
     estado: Mapped[str] = mapped_column(String(50), nullable=False)
+    trial_inicio: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     trial_fin: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    periodo_inicio: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     periodo_fin: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancelado_en: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class TenantAdministrator(Base):
+    __tablename__ = "tenant_administrator"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "usuario_global_id",
+            name="uq_tenant_administrator_tenant_usuario",
+        ),
+        UniqueConstraint(
+            "invitacion_id", name="uq_tenant_administrator_invitacion"
+        ),
+        Index("ix_tenant_administrator_usuario_activo", "usuario_global_id", "activo"),
+        Index("ix_tenant_administrator_tenant_activo", "tenant_id", "activo"),
+    )
+    id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("tenant.id", name="fk_tenant_administrator_tenant"), nullable=False
+    )
+    usuario_global_id: Mapped[UUID] = mapped_column(
+        ForeignKey("usuario_global.id", name="fk_tenant_administrator_usuario_global"),
+        nullable=False,
+    )
+    invitacion_id: Mapped[UUID] = mapped_column(
+        ForeignKey("invitacion.id", name="fk_tenant_administrator_invitacion"), nullable=False
+    )
+    activo: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    creado_en: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+    desactivado_en: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class EventoFacturacion(Base):
@@ -77,3 +124,5 @@ class EventoFacturacion(Base):
         ForeignKey("checkout_intencion.id"), nullable=True
     )
     payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resultado_periodo_inicio: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resultado_periodo_fin: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
